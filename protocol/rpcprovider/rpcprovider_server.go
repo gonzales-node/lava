@@ -682,13 +682,9 @@ func (rpcps *RPCProviderServer) TryRelay(ctx context.Context, request *pairingty
 	var latestBlock int64
 	var requestedHashes []*chaintracker.BlockStore
 	var modifiedReqBlock int64
-	var blocksInFinalizationData uint32
-	var blockDistanceToFinalization uint32
-	var averageBlockTime time.Duration
-	updatedChainMessage := false
-	var blockLagForQosSync int64
-	blockLagForQosSync, averageBlockTime, blockDistanceToFinalization, blocksInFinalizationData = rpcps.chainParser.ChainBlockStats()
+	blockLagForQosSync, averageBlockTime, blockDistanceToFinalization, blocksInFinalizationData := rpcps.chainParser.ChainBlockStats()
 	relayTimeout := chainlib.GetRelayTimeout(chainMsg, averageBlockTime)
+	var updatedChainMessage bool
 	if dataReliabilityEnabled {
 		var err error
 		specificBlock := request.RelayData.RequestBlock
@@ -719,7 +715,7 @@ func (rpcps *RPCProviderServer) TryRelay(ctx context.Context, request *pairingty
 			updatedChainMessage = true // meaning we can't bring a newer proof
 		}
 		// requestedBlockHash, finalizedBlockHashes = chaintracker.FindRequestedBlockHash(requestedHashes, request.RelayData.RequestBlock, toBlock, fromBlock, finalizedBlockHashes)
-		finalized = spectypes.IsFinalizedBlock(modifiedReqBlock, latestBlock, blockDistanceToFinalization)
+		finalized = spectypes.IsFinalizedBlock(modifiedReqBlock, latestBlock, int64(blockDistanceToFinalization))
 		if !finalized && requestedBlockHash == nil && modifiedReqBlock != spectypes.NOT_APPLICABLE {
 			// avoid using cache, but can still service
 			utils.LavaFormatWarning("no hash data for requested block", nil, utils.Attribute{Key: "specID", Value: rpcps.rpcProviderEndpoint.ChainID}, utils.Attribute{Key: "GUID", Value: ctx}, utils.Attribute{Key: "requestedBlock", Value: request.RelayData.RequestBlock}, utils.Attribute{Key: "latestBlock", Value: latestBlock}, utils.Attribute{Key: "modifiedReqBlock", Value: modifiedReqBlock}, utils.Attribute{Key: "specificBlock", Value: specificBlock})
