@@ -2,6 +2,7 @@ package chainlib
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -56,6 +57,7 @@ type ConsumerWSSubscriptionManager struct {
 	activeSubscriptionProvidersStorage *lavasession.ActiveSubscriptionProvidersStorage
 	unsubscribeParamsExtractor         func(request ChainMessage, reply *rpcclient.JsonrpcMessage) string
 	currentlyPendingSubscriptions      map[string]*pendingSubscriptionsBroadcastManager
+	jsonrpcIdToHashedParamsStorage     *common.BiMap[string, string] // keys 1 is id, key 2 is hashed params
 	lock                               sync.RWMutex
 }
 
@@ -79,6 +81,7 @@ func NewConsumerWSSubscriptionManager(
 		connectionType:                     connectionType,
 		activeSubscriptionProvidersStorage: activeSubscriptionProvidersStorage,
 		unsubscribeParamsExtractor:         unsubscribeParamsExtractor,
+		jsonrpcIdToHashedParamsStorage:     common.NewBiMap[string, string](),
 	}
 }
 
@@ -389,6 +392,20 @@ func (cwsm *ConsumerWSSubscriptionManager) StartSubscription(
 		connectedDapps:                          map[string]struct{}{dappKey: {}},
 	}
 
+	if chainMessage.GetApiCollection().CollectionData.ApiInterface == spectypes.APIInterfaceJsonRPC {
+		subscriptionJsonRpcId, err := retrieveJsonRpcSubscriptionIdFromRpcMessage(replyJsonrpcMessage.Result)
+		if err != nil {
+			return nil, nil, utils.LavaFormatError("could not retrieve jsonrpc subscription id", err,
+				utils.LogAttr("GUID", webSocketCtx),
+				utils.LogAttr("params", chainMessage.GetRPCMessage().GetParams()),
+				utils.LogAttr("hashedParams", utils.ToHexString(hashedParams)),
+				utils.LogAttr("dappKey", dappKey),
+				utils.LogAttr("reply", reply.Data),
+			)
+		}
+		cwsm.jsonrpcIdToHashedParamsStorage.Insert(subscriptionJsonRpcId, hashedParams)
+	}
+
 	providerAddr := relayResult.ProviderInfo.ProviderAddress
 	cwsm.activeSubscriptionProvidersStorage.AddProvider(providerAddr)
 	cwsm.connectDappWithSubscription(dappKey, websocketRepliesSafeChannelSender, hashedParams)
@@ -485,13 +502,18 @@ func (cwsm *ConsumerWSSubscriptionManager) listenForSubscriptionMessages(
 				utils.LogAttr("chainMessage", cwsm.activeSubscriptions),
 			)
 		}
+
 		delete(cwsm.activeSubscriptions, hashedParams)
-		utils.LavaFormatTrace("after delete")
+		found := cwsm.jsonrpcIdToHashedParamsStorage.RemoveByKey2(hashedParams)
+		if !found {
+			utils.LavaFormatError("could not find hashed params in jsonrpcIdToHashedParamsStorage", nil, utils.LogAttr("hashedParams", utils.ToHexString(hashedParams)))
+		}
+		utils.LavaFormatTrace("after delete", utils.LogAttr("hashedParams", utils.ToHexString(hashedParams)))
 
 		cwsm.activeSubscriptionProvidersStorage.RemoveProvider(providerAddr)
-		utils.LavaFormatTrace("after remove")
+		utils.LavaFormatTrace("after remove", utils.LogAttr("providerAddr", providerAddr))
 		cwsm.relaySender.CancelSubscriptionContext(hashedParams)
-		utils.LavaFormatTrace("after cancel")
+		utils.LavaFormatTrace("after cancel", utils.LogAttr("hashedParams", utils.ToHexString(hashedParams)))
 	}()
 
 	for {
@@ -615,6 +637,33 @@ func (cwsm *ConsumerWSSubscriptionManager) getHashedParams(chainMessage ChainMes
 	return hashedParams, params, nil
 }
 
+func retrieveJsonRpcSubscriptionIdFromRpcMessage(rpcField interface{}) (string, error) {
+	switch params := rpcField.(type) {
+	case []interface{}:
+		switch param := params[0].(type) {
+		case string:
+			return param, nil
+		default:
+			return "", fmt.Errorf("could not extract subscription jsonrpc id from message")
+		}
+	case json.RawMessage:
+		var subscriptionJsonRpcIdArray interface{}
+		err := gojson.Unmarshal(params, &subscriptionJsonRpcIdArray)
+		if err != nil {
+			return "", err
+		}
+
+		switch subscriptionJsonRpcIdArray := subscriptionJsonRpcIdArray.(type) {
+		case string:
+			return subscriptionJsonRpcIdArray, nil
+		default:
+			return "", fmt.Errorf("could not extract subscription jsonrpc id from message")
+		}
+	default:
+		return "", fmt.Errorf("could not extract subscription jsonrpc id from message")
+	}
+}
+
 func (cwsm *ConsumerWSSubscriptionManager) Unsubscribe(webSocketCtx context.Context, chainMessage ChainMessage, directiveHeaders map[string]string, relayRequestData *pairingtypes.RelayPrivateData, dappID, consumerIp string, metricsData *metrics.RelayMetrics) error {
 	utils.LavaFormatTrace("want to unsubscribe",
 		utils.LogAttr("GUID", webSocketCtx),
@@ -622,9 +671,31 @@ func (cwsm *ConsumerWSSubscriptionManager) Unsubscribe(webSocketCtx context.Cont
 		utils.LogAttr("consumerIp", consumerIp),
 	)
 
-	hashedParams, _, err := cwsm.getHashedParams(chainMessage)
-	if err != nil {
-		return utils.LavaFormatError("could not marshal params", err)
+	var hashedParams string
+	if chainMessage.GetApiCollection().CollectionData.ApiInterface == spectypes.APIInterfaceJsonRPC {
+		subscriptionJsonRpcId, err := retrieveJsonRpcSubscriptionIdFromRpcMessage(chainMessage.GetRPCMessage().GetParams())
+		if err != nil {
+			return utils.LavaFormatError("could not retrieve jsonrpc subscription id from message", err,
+				utils.LogAttr("GUID", webSocketCtx),
+				utils.LogAttr("dappID", dappID),
+				utils.LogAttr("consumerIp", consumerIp),
+				utils.LogAttr("requestData", string(relayRequestData.Data)),
+			)
+		}
+
+		var foundId bool
+		hashedParams, foundId = cwsm.jsonrpcIdToHashedParamsStorage.RetrieveByKey1(subscriptionJsonRpcId)
+		if !foundId {
+			return utils.LavaFormatError("could not find hashed params for given jsonrpc's params id", nil,
+				utils.LogAttr("jsonrpcMessage", string(relayRequestData.Data)),
+			)
+		}
+	} else {
+		var err error
+		hashedParams, _, err = cwsm.getHashedParams(chainMessage)
+		if err != nil {
+			return utils.LavaFormatError("could not marshal params", err)
+		}
 	}
 
 	dappKey := cwsm.relaySender.CreateDappKey(dappID, consumerIp)
