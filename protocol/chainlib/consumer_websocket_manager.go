@@ -6,9 +6,10 @@ import (
 	"sync"
 	"time"
 
-	gojson "github.com/goccy/go-json"
+	"github.com/goccy/go-json"
 	"github.com/gofiber/websocket/v2"
 	formatter "github.com/lavanet/lava/ecosystem/cache/format"
+	"github.com/lavanet/lava/protocol/chainlib/chainproxy/rpcclient"
 	"github.com/lavanet/lava/protocol/common"
 	"github.com/lavanet/lava/protocol/metrics"
 	"github.com/lavanet/lava/utils"
@@ -199,7 +200,7 @@ func (cwm *ConsumerWebsocketManager) ListenToMessages() {
 
 			// Handle the case when the error is a method not found error
 			if common.APINotSupportedError.Is(err) {
-				msgData, err := gojson.Marshal(common.JsonRpcMethodNotFoundError)
+				msgData, err := json.Marshal(common.JsonRpcMethodNotFoundError)
 				if err != nil {
 					continue
 				}
@@ -228,7 +229,18 @@ func (cwm *ConsumerWebsocketManager) ListenToMessages() {
 				)
 
 				for reply := range subscriptionMsgsChan {
-					websocketConnWriteChan <- webSocketMsgWithType{messageType: messageType, msg: outputFormatter(reply.Data)}
+					msgToSend, err := useOutputFormatterIfNeeded(reply.Data, outputFormatter)
+					if err != nil {
+						utils.LavaFormatWarning("error when unmarshal reply data", err,
+							utils.LogAttr("GUID", webSocketCtx),
+							utils.LogAttr("dappID", dappID),
+							utils.LogAttr("userIp", userIp),
+							utils.LogAttr("replyData", string(reply.Data)),
+							utils.LogAttr("params", chainMessage.GetRPCMessage().GetParams()),
+						)
+						continue
+					}
+					websocketConnWriteChan <- webSocketMsgWithType{messageType: messageType, msg: msgToSend}
 				}
 
 				utils.LavaFormatTrace("subscriptionMsgsChan was closed",
@@ -247,11 +259,38 @@ func (cwm *ConsumerWebsocketManager) ListenToMessages() {
 		go logger.AddMetricForWebSocket(metricsData, err, websocketConn)
 
 		if reply != nil {
-			reply.Data = outputFormatter(reply.Data) // use that id for the reply
+			msgToSend, err := useOutputFormatterIfNeeded(reply.Data, outputFormatter)
+			if err != nil {
+				utils.LavaFormatWarning("error when unmarshal reply data", err,
+					utils.LogAttr("GUID", webSocketCtx),
+					utils.LogAttr("dappID", dappID),
+					utils.LogAttr("userIp", userIp),
+					utils.LogAttr("replyData", string(reply.Data)),
+					utils.LogAttr("params", chainMessage.GetRPCMessage().GetParams()),
+				)
+				continue
+			}
+			reply.Data = msgToSend // use that id for the reply
 
 			websocketConnWriteChan <- webSocketMsgWithType{messageType: messageType, msg: reply.Data}
 
 			logger.LogRequestAndResponse("jsonrpc ws msg", false, "ws", websocketConn.LocalAddr().String(), string(msg), string(reply.Data), msgSeed, time.Since(startTime), nil)
 		}
 	}
+}
+
+func useOutputFormatterIfNeeded(data []byte, outputFormatter func([]byte) []byte) ([]byte, error) {
+	var replyJsonrpcMessage rpcclient.JsonrpcMessage
+	err := json.Unmarshal(data, &replyJsonrpcMessage)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the message does not have an id, we don't need to use the outputFormatter
+	msgToSend := data
+	if replyJsonrpcMessage.ID != nil {
+		msgToSend = outputFormatter(data)
+	}
+
+	return msgToSend, nil
 }
