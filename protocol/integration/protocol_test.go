@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -814,37 +815,46 @@ func TestConsumerProviderSubscriptionsHappyFlow(t *testing.T) {
 	utils.SetGlobalLoggingLevel("trace")
 
 	playbook := []struct {
-		name                 string
-		specId               string
-		apiInterface         string
-		webSocketRoute       string
-		subscribeMethod      string
-		requestParams        interface{}
-		nodeFirstReplyResult interface{}
-		expectedFirstMessage string
-		expectedEventMessage string
+		name                     string
+		specId                   string
+		apiInterface             string
+		webSocketRoute           string
+		subscribeMethod          string
+		unsubscribeMethod        string
+		nonSubscribeMethod       string
+		subscribeRequestParams   interface{}
+		unsubscribeRequestParams interface{}
+		nodeFirstReplyResult     interface{}
+		expectedFirstMessage     string
+		expectedEventMessage     string
 	}{
 		{
-			name:                 "jsonrpc",
-			specId:               "ETH1",
-			apiInterface:         spectypes.APIInterfaceJsonRPC,
-			webSocketRoute:       "/ws",
-			subscribeMethod:      "eth_subscribe",
-			requestParams:        []string{"newHeads"},
-			nodeFirstReplyResult: "0x5c72f30e7db63d5a7e5f90f75e28c217",
-			expectedFirstMessage: `{"jsonrpc":"2.0","id":1,"result":"0x5c72f30e7db63d5a7e5f90f75e28c217"}`,
-			expectedEventMessage: `{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x5c72f30e7db63d5a7e5f90f75e28c217","result":{}}}`,
+			name:                     "jsonrpc",
+			specId:                   "ETH1",
+			apiInterface:             spectypes.APIInterfaceJsonRPC,
+			webSocketRoute:           "/ws",
+			subscribeMethod:          "eth_subscribe",
+			unsubscribeMethod:        "eth_unsubscribe",
+			nonSubscribeMethod:       "eth_blockNumber",
+			subscribeRequestParams:   []string{"newHeads"},
+			unsubscribeRequestParams: []string{"0x5c72f30e7db63d5a7e5f90f75e28c217"},
+			nodeFirstReplyResult:     "0x5c72f30e7db63d5a7e5f90f75e28c217",
+			expectedFirstMessage:     `{"jsonrpc":"2.0","id":1,"result":"0x5c72f30e7db63d5a7e5f90f75e28c217"}`,
+			expectedEventMessage:     `{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x5c72f30e7db63d5a7e5f90f75e28c217","result":{}}}`,
 		},
 		{
-			name:                 "tendermintrpc",
-			specId:               "LAV1",
-			apiInterface:         spectypes.APIInterfaceTendermintRPC,
-			webSocketRoute:       "/websocket",
-			subscribeMethod:      "subscribe",
-			requestParams:        map[string]interface{}{"query": "tm.event='NewBlock'"},
-			nodeFirstReplyResult: struct{}{},
-			expectedFirstMessage: `{"jsonrpc":"2.0","id":1,"result":{}}`,
-			expectedEventMessage: `{"jsonrpc":"2.0","id":1,"result":{"query":"tm.event='NewBlock'"}}`,
+			name:                     "tendermintrpc",
+			specId:                   "LAV1",
+			apiInterface:             spectypes.APIInterfaceTendermintRPC,
+			webSocketRoute:           "/websocket",
+			subscribeMethod:          "subscribe",
+			unsubscribeMethod:        "unsubscribe",
+			nonSubscribeMethod:       "status",
+			subscribeRequestParams:   map[string]interface{}{"query": "tm.event='NewBlock'"},
+			unsubscribeRequestParams: map[string]interface{}{"query": "tm.event='NewBlock'"},
+			nodeFirstReplyResult:     struct{}{},
+			expectedFirstMessage:     `{"jsonrpc":"2.0","id":1,"result":{}}`,
+			expectedEventMessage:     `{"jsonrpc":"2.0","id":1,"result":{"query":"tm.event='NewBlock'"}}`,
 		},
 	}
 	for _, play := range playbook {
@@ -878,11 +888,13 @@ func TestConsumerProviderSubscriptionsHappyFlow(t *testing.T) {
 
 			consumerAccount := sigs.GenerateDeterministicFloatingKey(randomizer)
 
-			webSocketShouldListen := true
+			webSocketShouldListen := atomic.Bool{}
+			webSocketShouldListen.Store(true)
 			defer func() {
-				webSocketShouldListen = false
+				webSocketShouldListen.Store(false)
 			}()
 
+			nonSubscriptionMessageReplyFormat := `{"jsonrpc":"2.0","id":%v,"result":{}}`
 			// Create the provider message handlers
 			createProviderWsMessageHandler := func(providerData *providerData) func(messageType int, data []byte) {
 				return func(messageType int, data []byte) {
@@ -891,29 +903,39 @@ func TestConsumerProviderSubscriptionsHappyFlow(t *testing.T) {
 					err := json.Unmarshal(data, &jsonRpcMessage)
 					require.NoError(t, err)
 
+					subscriptionActive := atomic.Bool{}
 					// check if it's a subscription message
 					if jsonRpcMessage.Method == play.subscribeMethod {
 						// start sending messages to channel every second
 						// the first time is the result, and the rest are just empty messages
 						isFirstMessage := true
+						if isFirstMessage {
+							isFirstMessage = false
+							message := fmt.Sprintf(`{"jsonrpc":"2.0","result": %q, "id": %v}`, play.nodeFirstReplyResult, string(jsonRpcMessage.ID))
+							providerData.replySetter.wsMessageChannel <- []byte(message)
+						}
+
+						subscriptionActive.Store(true)
 						go func() {
 							for {
-								if !webSocketShouldListen {
+								if !webSocketShouldListen.Load() || !subscriptionActive.Load() {
 									return
 								}
 
-								var message string
-								if isFirstMessage {
-									isFirstMessage = false
-									message = fmt.Sprintf(`{"jsonrpc":"2.0","result": %q, "id": %v}`, play.nodeFirstReplyResult, string(jsonRpcMessage.ID))
-								} else {
-									message = play.expectedEventMessage
-								}
+								message := play.expectedEventMessage
 
+								// send an event message every second
 								providerData.replySetter.wsMessageChannel <- []byte(message)
 								time.Sleep(1 * time.Second)
 							}
 						}()
+					} else if jsonRpcMessage.Method == play.unsubscribeMethod {
+						// stop sending messages to the channel
+						subscriptionActive.Store(false)
+					} else {
+						// send a response message
+						response := fmt.Sprintf(nonSubscriptionMessageReplyFormat, string(jsonRpcMessage.ID))
+						providerData.replySetter.wsMessageChannel <- []byte(response)
 					}
 				}
 			}
@@ -963,18 +985,18 @@ func TestConsumerProviderSubscriptionsHappyFlow(t *testing.T) {
 			// Init the websocket client
 			websocketClient := createWebSocketClient("ws://" + consumerListenAddress + play.webSocketRoute)
 			defer func() {
-				webSocketShouldListen = false
+				webSocketShouldListen.Swap(false)
 				websocketClient.Close()
 			}()
 
-			messages := []string{}
+			messagesChannel := make(chan string, 1)
 
 			// Start listening to the websocket messages
 			go func() {
 				for {
 					_, message, err := websocketClient.ReadMessage()
 					if err != nil {
-						if webSocketShouldListen {
+						if webSocketShouldListen.Load() {
 							panic(err)
 						}
 
@@ -982,7 +1004,7 @@ func TestConsumerProviderSubscriptionsHappyFlow(t *testing.T) {
 						return
 					}
 
-					messages = append(messages, string(message))
+					messagesChannel <- string(message)
 				}
 			}()
 
@@ -990,33 +1012,104 @@ func TestConsumerProviderSubscriptionsHappyFlow(t *testing.T) {
 			err := websocketClient.WriteJSON(map[string]interface{}{
 				"jsonrpc": "2.0",
 				"method":  play.subscribeMethod,
-				"params":  play.requestParams,
+				"params":  play.subscribeRequestParams,
 				"id":      1,
 			})
 			require.NoError(t, err)
 
-			// Wait until we receive at least 2 messages
+			// Make sure we got the first reply message
+			select {
+			case message := <-messagesChannel:
+				require.Equal(t, play.expectedFirstMessage, message)
+			case <-time.After(5 * time.Second):
+				require.Fail(t, "did not receive the first message in time")
+			}
+
+			// Make sure we got the event message
+			select {
+			case message := <-messagesChannel:
+				require.Equal(t, play.expectedEventMessage, message)
+			case <-time.After(5 * time.Second):
+				require.Fail(t, "did not receive the event message in time")
+			}
+
+			// send a regular message to web socket
+			err = websocketClient.WriteJSON(map[string]interface{}{
+				"jsonrpc": "2.0",
+				"method":  play.nonSubscribeMethod,
+				"params":  []string{},
+				"id":      2,
+			})
+			require.NoError(t, err)
+
+			// check we got a response
+			expectedReply := fmt.Sprintf(nonSubscriptionMessageReplyFormat, 2)
 			func() {
-				start := time.Now()
+				timer := time.After(10 * time.Second)
 				for {
-					if len(messages) >= 2 {
+					select {
+					case message, ok := <-messagesChannel:
+						if !ok {
+							require.Fail(t, "channel closed before receiving the expected message")
+							return
+						}
+						if message == expectedReply {
+							return
+						}
+					case <-timer:
+						require.Fail(t, "did not receive the expected message in time")
 						return
 					}
-
-					if time.Since(start) > 5*time.Hour {
-						require.Fail(t, "did not receive enough messages in time from subscription", "messages", messages)
-					}
-
-					time.Sleep(100 * time.Millisecond)
 				}
 			}()
 
-			// Check the messages
-			firstMessage := messages[0]
-			require.Equal(t, play.expectedFirstMessage, firstMessage)
+			// unsubscribe from the subscription
+			err = websocketClient.WriteJSON(map[string]interface{}{
+				"jsonrpc": "2.0",
+				"method":  play.unsubscribeMethod,
+				"params":  play.unsubscribeRequestParams,
+				"id":      3,
+			})
+			require.NoError(t, err)
 
-			secondMessage := messages[1]
-			require.Equal(t, play.expectedEventMessage, secondMessage)
+			// drain the channel to make sure it's empty
+			func() {
+				drainTimeout := time.After(5 * time.Second)
+
+				for {
+					select {
+					case _, ok := <-messagesChannel:
+						if !ok {
+							// Channel is closed, returning false to fail the test
+							require.Fail(t, "channel closed before receiving the expected message")
+							return
+						}
+					case <-drainTimeout:
+						return
+					}
+				}
+			}()
+
+			// make sure we don't get any more messages after unsubscribing
+			ensureChannelStaysEmpty := func() bool {
+				drainTimeout := time.After(5 * time.Second)
+
+				for {
+					select {
+					case _, ok := <-messagesChannel:
+						if !ok {
+							require.Fail(t, "channel closed before receiving the expected message")
+						} else {
+							require.Fail(t, "channel was not empty after unsubscribing")
+						}
+						return false
+					case <-drainTimeout:
+						return true
+					}
+				}
+			}()
+
+			require.True(t, ensureChannelStaysEmpty, "channel was not empty or closed after unsubscribing")
 		})
 	}
 }
