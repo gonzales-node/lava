@@ -300,25 +300,11 @@ func (rpcc *RPCConsumer) Start(ctx context.Context, options *rpcConsumerStartOpt
 			rpcConsumerServer := &RPCConsumerServer{}
 
 			var consumerWsSubscriptionManager *chainlib.ConsumerWSSubscriptionManager
-			var specMethodType string
-			var paramsExtractorFunc func(request chainlib.ChainMessage, reply *rpcclient.JsonrpcMessage) string
-			switch rpcEndpoint.ApiInterface {
-			case spectypes.APIInterfaceTendermintRPC:
-				paramsExtractorFunc = func(request chainlib.ChainMessage, reply *rpcclient.JsonrpcMessage) string {
-					params, err := gojson.Marshal(request.GetRPCMessage().GetParams())
-					if err != nil {
-						utils.LavaFormatWarning("failed marshaling params", err, utils.LogAttr("request", request))
-						return ""
-					}
-					return string(params)
-				}
-			case spectypes.APIInterfaceJsonRPC:
-				paramsExtractorFunc = func(request chainlib.ChainMessage, reply *rpcclient.JsonrpcMessage) string {
-					return string(reply.Result)
-				}
-				specMethodType = http.MethodPost
+
+			if rpcEndpoint.ApiInterface == spectypes.APIInterfaceJsonRPC || rpcEndpoint.ApiInterface == spectypes.APIInterfaceTendermintRPC {
+				specMethodType, paramsExtractorFunc := GetSpecMethodTypeAndParamsExtractorFuncForApiInterface(rpcEndpoint.ApiInterface)
+				consumerWsSubscriptionManager = chainlib.NewConsumerWSSubscriptionManager(consumerSessionManager, rpcConsumerServer, options.refererData, specMethodType, chainParser, activeSubscriptionProvidersStorage, paramsExtractorFunc)
 			}
-			consumerWsSubscriptionManager = chainlib.NewConsumerWSSubscriptionManager(consumerSessionManager, rpcConsumerServer, options.refererData, specMethodType, chainParser, activeSubscriptionProvidersStorage, paramsExtractorFunc)
 
 			utils.LavaFormatInfo("RPCConsumer Listening", utils.Attribute{Key: "endpoints", Value: rpcEndpoint.String()})
 			err = rpcConsumerServer.ServeRPCRequests(ctx, rpcEndpoint, rpcc.consumerStateTracker, chainParser, finalizationConsensus, consumerSessionManager, options.requiredResponses, privKey, lavaChainID, options.cache, rpcConsumerMetrics, consumerAddr, consumerConsistency, relaysMonitor, options.cmdFlags, options.stateShare, options.refererData, consumerReportsManager, consumerWsSubscriptionManager)
@@ -361,6 +347,27 @@ func (rpcc *RPCConsumer) Start(ctx context.Context, options *rpcConsumerStartOpt
 	signal.Notify(signalChan, os.Interrupt)
 	<-signalChan
 	return nil
+}
+
+func GetSpecMethodTypeAndParamsExtractorFuncForApiInterface(apiInterface string) (specMethodType string, paramsExtractorFunc func(request chainlib.ChainMessage, reply *rpcclient.JsonrpcMessage) string) {
+	switch apiInterface {
+	case spectypes.APIInterfaceTendermintRPC:
+		paramsExtractorFunc = func(request chainlib.ChainMessage, reply *rpcclient.JsonrpcMessage) string {
+			params, err := gojson.Marshal(request.GetRPCMessage().GetParams())
+			if err != nil {
+				utils.LavaFormatWarning("failed marshaling params", err, utils.LogAttr("request", request))
+				return ""
+			}
+			return string(params)
+		}
+	case spectypes.APIInterfaceJsonRPC:
+		paramsExtractorFunc = func(_ chainlib.ChainMessage, reply *rpcclient.JsonrpcMessage) string {
+			return string(reply.Result)
+		}
+		specMethodType = http.MethodPost
+	}
+
+	return
 }
 
 func ParseEndpoints(viper_endpoints *viper.Viper, geolocation uint64) (endpoints []*lavasession.RPCEndpoint, err error) {
