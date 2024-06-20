@@ -66,9 +66,11 @@ func (m *mockConsumerStateTracker) GetLatestVirtualEpoch() uint64 {
 }
 
 type ReplySetter struct {
-	status       int
-	replyDataBuf []byte
-	handler      func([]byte, http.Header) ([]byte, int)
+	status           int
+	replyDataBuf     []byte
+	httpHandler      func([]byte, http.Header) ([]byte, int)
+	wsMessageHandler func(int, []byte)
+	wsMessageChannel chan []byte
 }
 
 type mockProviderStateTracker struct {

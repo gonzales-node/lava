@@ -160,11 +160,26 @@ func createInMemoryRewardDb(specs []string) (*rewardserver.RewardDB, error) {
 }
 
 func createRpcConsumer(t *testing.T, ctx context.Context, specId string, apiInterface string, account sigs.Account, consumerListenAddress string, epoch uint64, pairingList map[uint64]*lavasession.ConsumerSessionsWithProvider, requiredResponses int, lavaChainID string) *rpcconsumer.RPCConsumerServer {
-	serverHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	httpServerHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Handle the incoming request and provide the desired response
 		w.WriteHeader(http.StatusOK)
 	})
-	chainParser, _, chainFetcher, _, _, err := chainlib.CreateChainLibMocks(ctx, specId, apiInterface, serverHandler, nil, "../../", nil)
+
+	var wsServerHandler http.HandlerFunc
+	if apiInterface == spectypes.APIInterfaceJsonRPC || apiInterface == spectypes.APIInterfaceTendermintRPC {
+		upGrader := websocket.Upgrader{}
+
+		wsServerHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upGrader.Upgrade(w, r, nil)
+			if err != nil {
+				fmt.Println(err)
+				panic("got error in upgrader")
+			}
+			defer conn.Close()
+		})
+	}
+
+	chainParser, _, chainFetcher, _, _, err := chainlib.CreateChainLibMocks(ctx, specId, apiInterface, httpServerHandler, wsServerHandler, "../../", nil)
 	require.NoError(t, err)
 	require.NotNil(t, chainParser)
 	require.NotNil(t, chainFetcher)
@@ -190,7 +205,22 @@ func createRpcConsumer(t *testing.T, ctx context.Context, specId string, apiInte
 	consumerCmdFlags := common.ConsumerCmdFlags{}
 	rpcsonumerLogs, err := metrics.NewRPCConsumerLogs(nil, nil)
 	require.NoError(t, err)
-	err = rpcConsumerServer.ServeRPCRequests(ctx, rpcEndpoint, consumerStateTracker, chainParser, finalizationConsensus, consumerSessionManager, requiredResponses, account.SK, lavaChainID, nil, rpcsonumerLogs, account.Addr, consumerConsistency, nil, consumerCmdFlags, false, nil, nil, nil)
+
+	var consumerWebSocketSubscriptionManager *chainlib.ConsumerWSSubscriptionManager
+	if apiInterface == spectypes.APIInterfaceJsonRPC || apiInterface == spectypes.APIInterfaceTendermintRPC {
+		specMethodType, paramsExtractorFunc := rpcconsumer.GetSpecMethodTypeAndParamsExtractorFuncForApiInterface(apiInterface)
+		consumerWebSocketSubscriptionManager = chainlib.NewConsumerWSSubscriptionManager(
+			consumerSessionManager,
+			rpcConsumerServer,
+			nil,
+			specMethodType,
+			chainParser,
+			lavasession.NewActiveSubscriptionProvidersStorage(),
+			paramsExtractorFunc,
+		)
+	}
+
+	err = rpcConsumerServer.ServeRPCRequests(ctx, rpcEndpoint, consumerStateTracker, chainParser, finalizationConsensus, consumerSessionManager, requiredResponses, account.SK, lavaChainID, nil, rpcsonumerLogs, account.Addr, consumerConsistency, nil, consumerCmdFlags, false, nil, nil, consumerWebSocketSubscriptionManager)
 	require.NoError(t, err)
 	// wait for consumer server to be up
 	consumerUp := checkServerStatusWithTimeout("http://"+consumerListenAddress, time.Millisecond*61)
@@ -203,27 +233,84 @@ func createRpcConsumer(t *testing.T, ctx context.Context, specId string, apiInte
 	return rpcConsumerServer
 }
 
+func createProviderWebSocketServerHandler(t *testing.T, replySetter *ReplySetter) http.HandlerFunc {
+	upgrader := websocket.Upgrader{}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			require.NoError(t, err)
+			return
+		}
+		defer conn.Close()
+
+		done := false
+		go func() {
+			for {
+				if done {
+					return
+				}
+
+				if replySetter.wsMessageChannel != nil {
+					select {
+					case data := <-replySetter.wsMessageChannel:
+						err := conn.WriteMessage(websocket.TextMessage, data)
+						if err != nil {
+							require.NoError(t, err)
+							return
+						}
+					default:
+					}
+				}
+
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+		defer func() { done = true }()
+
+		for {
+			// Read the request
+			messageType, message, err := conn.ReadMessage()
+			if err != nil {
+				require.NoError(t, err)
+				return
+			}
+
+			if replySetter.wsMessageHandler != nil {
+				replySetter.wsMessageHandler(messageType, message)
+			}
+		}
+	}
+
+}
+
 func createRpcProvider(t *testing.T, ctx context.Context, consumerAddress string, specId string, apiInterface string, listenAddress string, account sigs.Account, lavaChainID string, addons []string) (*rpcprovider.RPCProviderServer, *lavasession.RPCProviderEndpoint, *ReplySetter, *MockChainFetcher) {
 	replySetter := ReplySetter{
-		status:       http.StatusOK,
-		replyDataBuf: []byte(`{"reply": "REPLY-STUB"}`),
-		handler:      nil,
+		status:           http.StatusOK,
+		replyDataBuf:     []byte(`{"reply": "REPLY-STUB"}`),
+		httpHandler:      nil,
+		wsMessageHandler: nil,
+		wsMessageChannel: nil,
 	}
-	serverHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+	httpServerHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Handle the incoming request and provide the desired response
 
 		status := replySetter.status
 		data := replySetter.replyDataBuf
-		if replySetter.handler != nil {
+		if replySetter.httpHandler != nil {
 			data = make([]byte, r.ContentLength)
 			r.Body.Read(data)
-			data, status = replySetter.handler(data, r.Header)
+			data, status = replySetter.httpHandler(data, r.Header)
 		}
 		w.WriteHeader(status)
 		fmt.Fprint(w, string(data))
 	})
 
-	chainParser, chainRouter, chainFetcher, _, endpoint, err := chainlib.CreateChainLibMocks(ctx, specId, apiInterface, serverHandler, nil, "../../", addons)
+	// Create a simple websocket server that mocks the node
+	wsServerHandler := createProviderWebSocketServerHandler(t, &replySetter)
+
+	chainParser, chainRouter, chainFetcher, _, endpoint, err := chainlib.CreateChainLibMocks(ctx, specId, apiInterface, httpServerHandler, wsServerHandler, "../../", addons)
 	require.NoError(t, err)
 	require.NotNil(t, chainParser)
 	require.NotNil(t, chainFetcher)
@@ -255,12 +342,14 @@ func createRpcProvider(t *testing.T, ctx context.Context, consumerAddress string
 	}
 	rewardDB, err := createInMemoryRewardDb([]string{specId})
 	require.NoError(t, err)
+
 	_, averageBlockTime, blocksToFinalization, blocksInFinalizationData := chainParser.ChainBlockStats()
 	mockProviderStateTracker := mockProviderStateTracker{consumerAddressForPairing: consumerAddress, averageBlockTime: averageBlockTime}
 	rws := rewardserver.NewRewardServer(&mockProviderStateTracker, nil, rewardDB, "badger_test", 1, 10, nil)
 
 	blockMemorySize, err := mockProviderStateTracker.GetEpochSizeMultipliedByRecommendedEpochNumToCollectPayment(ctx)
 	require.NoError(t, err)
+
 	providerSessionManager := lavasession.NewProviderSessionManager(rpcProviderEndpoint, blockMemorySize)
 	providerPolicy := rpcprovider.GetAllAddonsAndExtensionsFromNodeUrlSlice(rpcProviderEndpoint.NodeUrls)
 	chainParser.SetPolicy(providerPolicy, specId, apiInterface)
@@ -278,15 +367,23 @@ func createRpcProvider(t *testing.T, ctx context.Context, consumerAddress string
 	mockChainFetcher := NewMockChainFetcher(1000, int64(blocksToSaveChainTracker), nil)
 	chainTracker, err := chaintracker.NewChainTracker(ctx, mockChainFetcher, chainTrackerConfig)
 	require.NoError(t, err)
+
 	reliabilityManager := reliabilitymanager.NewReliabilityManager(chainTracker, &mockProviderStateTracker, account.Addr.String(), chainRouter, chainParser)
-	rpcProviderServer.ServeRPCRequests(ctx, rpcProviderEndpoint, chainParser, rws, providerSessionManager, reliabilityManager, account.SK, nil, chainRouter, &mockProviderStateTracker, account.Addr, lavaChainID, rpcprovider.DEFAULT_ALLOWED_MISSING_CU, nil, nil, nil)
+
+	providerNodeSubscriptionManager := chainlib.NewProviderNodeSubscriptionManager(chainRouter, chainParser, rpcProviderServer, account.SK)
+
+	rpcProviderServer.ServeRPCRequests(ctx, rpcProviderEndpoint, chainParser, rws, providerSessionManager, reliabilityManager, account.SK, nil, chainRouter, &mockProviderStateTracker, account.Addr, lavaChainID, rpcprovider.DEFAULT_ALLOWED_MISSING_CU, nil, nil, providerNodeSubscriptionManager)
+
 	listener := rpcprovider.NewProviderListener(ctx, rpcProviderEndpoint.NetworkAddress, "/health")
 	err = listener.RegisterReceiver(rpcProviderServer, rpcProviderEndpoint)
 	require.NoError(t, err)
+
 	chainParser.Activate()
 	chainTracker.RegisterForBlockTimeUpdates(chainParser)
+
 	providerUp := checkGrpcServerStatusWithTimeout(rpcProviderEndpoint.NetworkAddress.Address, time.Millisecond*261)
 	require.True(t, providerUp)
+
 	return rpcProviderServer, endpoint, &replySetter, mockChainFetcher
 }
 
@@ -441,7 +538,7 @@ func TestConsumerProviderWithProviders(t *testing.T) {
 						time.Sleep(3 * time.Millisecond) // cause timeout for providers we got a reply for so others get chosen with a bigger likelihood
 						return providers[id-1].replySetter.replyDataBuf, http.StatusOK
 					}
-					providers[id-1].replySetter.handler = handler
+					providers[id-1].replySetter.httpHandler = handler
 				}
 
 				require.Len(t, counter, numProviders) // make sure to talk with all of them
@@ -465,7 +562,7 @@ func TestConsumerProviderWithProviders(t *testing.T) {
 						}
 						return replySetter.replyDataBuf, http.StatusOK
 					}
-					providers[i].replySetter.handler = handler
+					providers[i].replySetter.httpHandler = handler
 				}
 
 				seenError := false
@@ -569,7 +666,7 @@ func TestConsumerProviderTx(t *testing.T) {
 						return []byte(`{"message":"bad","code":777}`), http.StatusInternalServerError
 					}
 				}
-				providers[i].replySetter.handler = handler
+				providers[i].replySetter.httpHandler = handler
 			}
 
 			client := http.Client{Timeout: 500 * time.Millisecond}
@@ -673,7 +770,7 @@ func TestConsumerProviderJsonRpcWithNullID(t *testing.T) {
 					response := fmt.Sprintf(`{"jsonrpc":"2.0","result": {}, "id": %v}`, string(jsonRpcMessage.ID))
 					return []byte(response), http.StatusOK
 				}
-				providers[i].replySetter.handler = handler
+				providers[i].replySetter.httpHandler = handler
 			}
 
 			client := http.Client{Timeout: 500 * time.Millisecond}
@@ -698,26 +795,56 @@ func TestConsumerProviderJsonRpcWithNullID(t *testing.T) {
 }
 
 func TestConsumerProviderSubscriptionsHappyFlow(t *testing.T) {
+	createWebSocketClient := func(endpoint string) *websocket.Conn {
+		websocketDialer := websocket.Dialer{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+		}
+
+		header := make(http.Header)
+
+		webSocketClient, _, err := websocketDialer.DialContext(context.Background(), endpoint, header)
+		if err != nil {
+			panic(err)
+		}
+
+		return webSocketClient
+	}
+
+	utils.SetGlobalLoggingLevel("trace")
+
 	playbook := []struct {
-		name         string
-		specId       string
-		method       string
-		expected     string
-		apiInterface string
+		name                 string
+		specId               string
+		apiInterface         string
+		webSocketRoute       string
+		subscribeMethod      string
+		requestParams        interface{}
+		nodeFirstReplyResult interface{}
+		expectedFirstMessage string
+		expectedEventMessage string
 	}{
 		{
-			name:         "jsonrpc",
-			specId:       "ETH1",
-			method:       "eth_blockNumber",
-			expected:     `{"jsonrpc":"2.0","id":null,"result":{}}`,
-			apiInterface: spectypes.APIInterfaceJsonRPC,
+			name:                 "jsonrpc",
+			specId:               "ETH1",
+			apiInterface:         spectypes.APIInterfaceJsonRPC,
+			webSocketRoute:       "/ws",
+			subscribeMethod:      "eth_subscribe",
+			requestParams:        []string{"newHeads"},
+			nodeFirstReplyResult: "0x5c72f30e7db63d5a7e5f90f75e28c217",
+			expectedFirstMessage: `{"jsonrpc":"2.0","id":1,"result":"0x5c72f30e7db63d5a7e5f90f75e28c217"}`,
+			expectedEventMessage: `{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x5c72f30e7db63d5a7e5f90f75e28c217","result":{}}}`,
 		},
 		{
-			name:         "tendermintrpc",
-			specId:       "LAV1",
-			method:       "status",
-			expected:     `{"jsonrpc":"2.0","result":{}}`,
-			apiInterface: spectypes.APIInterfaceTendermintRPC,
+			name:                 "tendermintrpc",
+			specId:               "LAV1",
+			apiInterface:         spectypes.APIInterfaceTendermintRPC,
+			webSocketRoute:       "/websocket",
+			subscribeMethod:      "subscribe",
+			requestParams:        map[string]interface{}{"query": "tm.event='NewBlock'"},
+			nodeFirstReplyResult: struct{}{},
+			expectedFirstMessage: `{"jsonrpc":"2.0","id":1,"result":{}}`,
+			expectedEventMessage: `{"jsonrpc":"2.0","id":1,"result":{"query":"tm.event='NewBlock'"}}`,
 		},
 	}
 	for _, play := range playbook {
@@ -729,34 +856,90 @@ func TestConsumerProviderSubscriptionsHappyFlow(t *testing.T) {
 			epoch := uint64(100)
 			requiredResponses := 1
 			lavaChainID := "lava"
-			numProviders := 5
+			numProviders := 1
 
 			consumerListenAddress := addressGen.GetAddress()
 			pairingList := map[uint64]*lavasession.ConsumerSessionsWithProvider{}
 			type providerData struct {
-				account          sigs.Account
-				endpoint         *lavasession.RPCProviderEndpoint
-				server           *rpcprovider.RPCProviderServer
-				replySetter      *ReplySetter
-				mockChainFetcher *MockChainFetcher
+				account     sigs.Account
+				endpoint    *lavasession.RPCProviderEndpoint
+				server      *rpcprovider.RPCProviderServer
+				replySetter *ReplySetter
 			}
+
 			providers := []providerData{}
 
+			// Create the providers
 			for i := 0; i < numProviders; i++ {
-				// providerListenAddress := "localhost:111" + strconv.Itoa(i)
 				account := sigs.GenerateDeterministicFloatingKey(randomizer)
 				providerDataI := providerData{account: account}
 				providers = append(providers, providerDataI)
 			}
+
 			consumerAccount := sigs.GenerateDeterministicFloatingKey(randomizer)
+
+			webSocketShouldListen := true
+			defer func() {
+				webSocketShouldListen = false
+			}()
+
+			// Create the provider message handlers
+			createProviderWsMessageHandler := func(providerData *providerData) func(messageType int, data []byte) {
+				return func(messageType int, data []byte) {
+					// parse the data
+					var jsonRpcMessage rpcInterfaceMessages.JsonrpcMessage
+					err := json.Unmarshal(data, &jsonRpcMessage)
+					require.NoError(t, err)
+
+					// check if it's a subscription message
+					if jsonRpcMessage.Method == play.subscribeMethod {
+						// start sending messages to channel every second
+						// the first time is the result, and the rest are just empty messages
+						isFirstMessage := true
+						go func() {
+							for {
+								if !webSocketShouldListen {
+									return
+								}
+
+								var message string
+								if isFirstMessage {
+									isFirstMessage = false
+									message = fmt.Sprintf(`{"jsonrpc":"2.0","result": %q, "id": %v}`, play.nodeFirstReplyResult, string(jsonRpcMessage.ID))
+								} else {
+									message = play.expectedEventMessage
+								}
+
+								providerData.replySetter.wsMessageChannel <- []byte(message)
+								time.Sleep(1 * time.Second)
+							}
+						}()
+					}
+				}
+			}
+
+			createProviderHttpMessageHandler := func() func(req []byte, header http.Header) (data []byte, status int) {
+				return func(req []byte, header http.Header) (data []byte, status int) {
+					var jsonRpcMessage rpcInterfaceMessages.JsonrpcMessage
+					err := json.Unmarshal(req, &jsonRpcMessage)
+					require.NoError(t, err)
+
+					response := fmt.Sprintf(`{"jsonrpc":"2.0","result": {}, "id": %v}`, string(jsonRpcMessage.ID))
+					return []byte(response), http.StatusOK
+				}
+			}
+
+			// Init providers and pairing list
 			for i := 0; i < numProviders; i++ {
 				ctx := context.Background()
-				providerDataI := providers[i]
 				listenAddress := addressGen.GetAddress()
-				providers[i].server, providers[i].endpoint, providers[i].replySetter, providers[i].mockChainFetcher = createRpcProvider(t, ctx, consumerAccount.Addr.String(), specId, apiInterface, listenAddress, providerDataI.account, lavaChainID, []string(nil))
+
+				providers[i].server, providers[i].endpoint, providers[i].replySetter, _ = createRpcProvider(t, ctx, consumerAccount.Addr.String(), specId, apiInterface, listenAddress, providers[i].account, lavaChainID, []string(nil))
 				providers[i].replySetter.replyDataBuf = []byte(fmt.Sprintf(`{"result": %d}`, i+1))
-			}
-			for i := 0; i < numProviders; i++ {
+				providers[i].replySetter.wsMessageChannel = make(chan []byte)
+				providers[i].replySetter.wsMessageHandler = createProviderWsMessageHandler(&providers[i])
+				providers[i].replySetter.httpHandler = createProviderHttpMessageHandler()
+
 				pairingList[uint64(i)] = &lavasession.ConsumerSessionsWithProvider{
 					PublicLavaAddress: providers[i].account.Addr.String(),
 					Endpoints: []*lavasession.Endpoint{
@@ -772,38 +955,68 @@ func TestConsumerProviderSubscriptionsHappyFlow(t *testing.T) {
 					PairingEpoch:     epoch,
 				}
 			}
+
+			// Create the consumer
 			rpcconsumerServer := createRpcConsumer(t, ctx, specId, apiInterface, consumerAccount, consumerListenAddress, epoch, pairingList, requiredResponses, lavaChainID)
 			require.NotNil(t, rpcconsumerServer)
 
-			for i := 0; i < numProviders; i++ {
-				handler := func(req []byte, header http.Header) (data []byte, status int) {
-					var jsonRpcMessage rpcInterfaceMessages.JsonrpcMessage
-					err := json.Unmarshal(req, &jsonRpcMessage)
-					require.NoError(t, err)
+			// Init the websocket client
+			websocketClient := createWebSocketClient("ws://" + consumerListenAddress + play.webSocketRoute)
+			defer func() {
+				webSocketShouldListen = false
+				websocketClient.Close()
+			}()
 
-					response := fmt.Sprintf(`{"jsonrpc":"2.0","result": {}, "id": %v}`, string(jsonRpcMessage.ID))
-					return []byte(response), http.StatusOK
+			messages := []string{}
+
+			// Start listening to the websocket messages
+			go func() {
+				for {
+					_, message, err := websocketClient.ReadMessage()
+					if err != nil {
+						if webSocketShouldListen {
+							panic(err)
+						}
+
+						// Once the test is done, we can safely ignore the error
+						return
+					}
+
+					messages = append(messages, string(message))
 				}
-				providers[i].replySetter.handler = handler
-			}
+			}()
 
-			client := http.Client{Timeout: 500 * time.Millisecond}
-			jsonMsg := fmt.Sprintf(`{"jsonrpc":"2.0","method":"%v","params": [], "id":null}`, play.method)
-			msgBuffer := bytes.NewBuffer([]byte(jsonMsg))
-			req, err := http.NewRequest(http.MethodPost, "http://"+consumerListenAddress, msgBuffer)
-			require.NoError(t, err)
-			req.Header.Set("Content-Type", "application/json")
-
-			resp, err := client.Do(req)
+			// Send the subscription message
+			err := websocketClient.WriteJSON(map[string]interface{}{
+				"jsonrpc": "2.0",
+				"method":  play.subscribeMethod,
+				"params":  play.requestParams,
+				"id":      1,
+			})
 			require.NoError(t, err)
 
-			bodyBytes, err := io.ReadAll(resp.Body)
-			require.NoError(t, err)
-			require.Equal(t, http.StatusOK, resp.StatusCode, string(bodyBytes))
+			// Wait until we receive at least 2 messages
+			func() {
+				start := time.Now()
+				for {
+					if len(messages) >= 2 {
+						return
+					}
 
-			resp.Body.Close()
+					if time.Since(start) > 5*time.Hour {
+						require.Fail(t, "did not receive enough messages in time from subscription", "messages", messages)
+					}
 
-			require.Equal(t, play.expected, string(bodyBytes))
+					time.Sleep(100 * time.Millisecond)
+				}
+			}()
+
+			// Check the messages
+			firstMessage := messages[0]
+			require.Equal(t, play.expectedFirstMessage, firstMessage)
+
+			secondMessage := messages[1]
+			require.Equal(t, play.expectedEventMessage, secondMessage)
 		})
 	}
 }
