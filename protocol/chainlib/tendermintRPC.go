@@ -776,9 +776,11 @@ func (cp *tendermintRpcChainProxy) SendRPC(ctx context.Context, nodeMessage *rpc
 	err = cp.ValidateRequestAndResponseIds(nodeMessage.ID, rpcMessage.ID)
 	if err != nil {
 		return nil, "", nil, utils.LavaFormatError("tendermintRPC ID mismatch error", err,
-			utils.Attribute{Key: "GUID", Value: ctx},
-			utils.Attribute{Key: "requestId", Value: nodeMessage.ID},
-			utils.Attribute{Key: "responseId", Value: rpcMessage.ID},
+			utils.LogAttr("GUID", ctx),
+			utils.LogAttr("request", nodeMessage),
+			utils.LogAttr("response", rpcMessage),
+			utils.LogAttr("requestId", nodeMessage.ID),
+			utils.LogAttr("responseId", rpcMessage.ID),
 		)
 	}
 

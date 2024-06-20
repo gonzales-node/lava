@@ -87,11 +87,11 @@ func (geh *genericErrorHandler) HandleJSONFormatError(replyData []byte) error {
 func (geh *genericErrorHandler) ValidateRequestAndResponseIds(nodeMessageID json.RawMessage, replyMsgID json.RawMessage) error {
 	reqId, idErr := rpcInterfaceMessages.IdFromRawMessage(nodeMessageID)
 	if idErr != nil {
-		return fmt.Errorf("Failed parsing ID " + idErr.Error())
+		return fmt.Errorf("Failed parsing ID from node message " + idErr.Error())
 	}
 	respId, idErr := rpcInterfaceMessages.IdFromRawMessage(replyMsgID)
 	if idErr != nil {
-		return fmt.Errorf("Failed parsing ID " + idErr.Error())
+		return fmt.Errorf("Failed parsing ID from reply message " + idErr.Error())
 	}
 	if reqId != respId {
 		return fmt.Errorf("ID mismatch error")
