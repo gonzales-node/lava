@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/lavanet/lava/utils"
 	"github.com/lavanet/lava/utils/rand"
 	"github.com/lavanet/lava/utils/sigs"
 
@@ -106,6 +107,8 @@ func genericWebSocketHandler() http.HandlerFunc {
 				panic("got error in ReadMessage")
 			}
 			fmt.Println("got message", message, messageType)
+			conn.WriteMessage(messageType, message)
+			fmt.Println("writing message", message, messageType)
 		}
 	}
 }
@@ -121,6 +124,7 @@ func CreateChainLibMocks(
 	getToTopMostPath string,
 	services []string,
 ) (cpar ChainParser, crout ChainRouter, cfetc chaintracker.ChainFetcher, closeServer func(), endpointRet *lavasession.RPCProviderEndpoint, errRet error) {
+	utils.SetGlobalLoggingLevel("debug")
 	closeServer = nil
 	spec, err := keepertest.GetASpec(specIndex, getToTopMostPath, nil, nil)
 	if err != nil {
