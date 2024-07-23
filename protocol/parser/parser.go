@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/goccy/go-json"
+	"github.com/itchyny/gojq"
 
 	sdkerrors "cosmossdk.io/errors"
 	"github.com/lavanet/lava/utils"
@@ -66,8 +67,8 @@ func ParseDefaultBlockParameter(block string) (int64, error) {
 }
 
 // this function returns the block that was requested,
-func ParseBlockFromParams(rpcInput RPCInput, blockParser spectypes.BlockParser) (int64, error) {
-	result, err := parse(rpcInput, blockParser, PARSE_PARAMS)
+func ParseBlockFromParams(rpcInput RPCInput, blockParser spectypes.BlockParser, genericParsers []spectypes.GenericParser) (int64, error) {
+	result, err := parse(rpcInput, blockParser, genericParsers, PARSE_PARAMS)
 	if err != nil || result == nil {
 		return spectypes.NOT_APPLICABLE, err
 	}
@@ -87,7 +88,7 @@ func ParseBlockFromParams(rpcInput RPCInput, blockParser spectypes.BlockParser) 
 
 // This returns the parsed response without decoding
 func ParseFromReply(rpcInput RPCInput, blockParser spectypes.BlockParser) (string, error) {
-	result, err := parse(rpcInput, blockParser, PARSE_RESULT)
+	result, err := parse(rpcInput, blockParser, nil, PARSE_RESULT)
 	if err != nil || result == nil {
 		return "", err
 	}
@@ -125,7 +126,7 @@ func ParseFromReplyAndDecode(rpcInput RPCInput, resultParser spectypes.BlockPars
 	return parseResponseByEncoding([]byte(response), resultParser.Encoding)
 }
 
-func parse(rpcInput RPCInput, blockParser spectypes.BlockParser, dataSource int) ([]interface{}, error) {
+func parse(rpcInput RPCInput, blockParser spectypes.BlockParser, genericParsers []spectypes.GenericParser, dataSource int) ([]interface{}, error) {
 	var retval []interface{}
 	var err error
 
@@ -148,8 +149,12 @@ func parse(rpcInput RPCInput, blockParser spectypes.BlockParser, dataSource int)
 
 	if err != nil {
 		if ValueNotSetError.Is(err) && blockParser.DefaultValue != "" {
-			// means this parsing failed because the value did not exist on an optional param
-			retval = appendInterfaceToInterfaceArray(blockParser.DefaultValue)
+			// means that block parsing failed because the value did not exist on an optional param
+			// we can try to parse using generic parsers, if any exist
+			retval, err = parseWithGenericParsers(rpcInput, genericParsers)
+			if err != nil {
+				retval = appendInterfaceToInterfaceArray(blockParser.DefaultValue)
+			}
 		} else {
 			return nil, err
 		}
@@ -160,6 +165,88 @@ func parse(rpcInput RPCInput, blockParser spectypes.BlockParser, dataSource int)
 	}
 
 	return retval, nil
+}
+
+func parseWithGenericParsers(rpcInput RPCInput, genericParsers []spectypes.GenericParser) ([]interface{}, error) {
+	if len(genericParsers) == 0 {
+		return nil, fmt.Errorf("no generic parsers to use")
+	}
+
+	jsonParams, err := json.Marshal(rpcInput.GetParams())
+	if err != nil {
+		return nil, utils.LavaFormatDebug("failed to marshal params",
+			utils.LogAttr("params", rpcInput.GetParams()),
+			utils.LogAttr("err", err),
+		)
+	}
+
+	// We try to parse the params with all the generic parsers, the first one that succeeds, its value is returned
+	for _, genericParser := range genericParsers {
+		retval, err := parseGeneric(string(jsonParams), genericParser)
+		if err == nil {
+			return retval, nil
+		}
+	}
+
+	// if we didn't find a generic parser that worked, we return an error
+	return nil, utils.LavaFormatWarning("failed to parse with generic parsers", ValueNotSetError,
+		utils.LogAttr("params", rpcInput.GetParams()),
+		utils.LogAttr("jsonParams", jsonParams),
+		utils.LogAttr("genericParsers", genericParsers),
+	)
+}
+
+func parseGeneric(input string, genericParser spectypes.GenericParser) ([]interface{}, error) {
+	value, err := findGenericParserValue(input, genericParser)
+	if err != nil {
+		return nil, err
+	}
+
+	utils.LavaFormatTrace("parsed generic value",
+		utils.LogAttr("input", input),
+		utils.LogAttr("genericParser", genericParser),
+		utils.LogAttr("value", value),
+	)
+
+	switch genericParser.ParseType {
+	case spectypes.PARSER_TYPE_BLOCK_LATEST:
+		return appendInterfaceToInterfaceArray(blockInterfaceToString(spectypes.LATEST_BLOCK)), nil
+	default:
+		return nil, fmt.Errorf("unsupported generic parser type")
+	}
+}
+
+func findGenericParserValue(input string, genericParser spectypes.GenericParser) (string, error) {
+	jqParser, err := gojq.Parse(genericParser.GetParsePath())
+	if err != nil {
+		return "", utils.LavaFormatError("failed to parse generic parser path", err, utils.LogAttr("path", genericParser.GetParsePath()))
+	}
+
+	iter := jqParser.Run(input)
+	for {
+		val, ok := iter.Next()
+		if !ok {
+			break
+		}
+
+		if val == nil {
+			continue
+		}
+
+		stringVal, ok := val.(string) // we expect the value to be a string
+		if !ok {
+			utils.LavaFormatTrace("generic parser path did not return a string",
+				utils.LogAttr("input", input),
+				utils.LogAttr("path", genericParser.GetParsePath()),
+			)
+		}
+
+		if stringVal == genericParser.Value {
+			return stringVal, nil
+		}
+	}
+
+	return "", utils.LavaFormatTrace("generic parser path did not return the expected value")
 }
 
 func parseDefault(input []string) []interface{} {
