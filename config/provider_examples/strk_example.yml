@@ -1,0 +1,19 @@
+endpoints:
+  - api-interface: jsonrpc
+    chain-id: STRK
+    network-address:
+      address: "127.0.0.1:2220"
+    node-urls:
+      - url: <wss url here>/ws
+        internal-path: ""
+      - url: <wss url here>/ws/rpc/v0_6
+        internal-path: "/rpc/v0_6"
+
+      - url: <https url here>/rpc/pathfinder/v0.1
+        internal-path: "/rpc/pathfinder/v0.1"
+      - url: <https url here>/rpc/v0_5
+        internal-path: "/rpc/v0_5"
+      - url: <https url here>/rpc/v0_6
+        internal-path: "/rpc/v0_6"
+      - url: <https url here>
+        internal-path: ""
