@@ -11,6 +11,7 @@ import (
 	"github.com/cosmos/cosmos-sdk/codec"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	paramtypes "github.com/cosmos/cosmos-sdk/x/params/types"
+	epochstoragetypes "github.com/lavanet/lava/x/epochstorage/types"
 	fixationtypes "github.com/lavanet/lava/x/fixationstore/types"
 	"github.com/lavanet/lava/x/pairing/types"
 )
@@ -34,6 +35,9 @@ type (
 		downtimeKeeper     types.DowntimeKeeper
 		dualstakingKeeper  types.DualstakingKeeper
 		stakingKeeper      types.StakingKeeper
+
+		pairingQueryCache *map[string][]epochstoragetypes.StakeEntry
+		pairingRelayCache *map[string][]epochstoragetypes.StakeEntry
 	}
 )
 
@@ -71,6 +75,9 @@ func NewKeeper(
 		ps = ps.WithKeyTable(types.ParamKeyTable())
 	}
 
+	emptypairingRelayCache := map[string][]epochstoragetypes.StakeEntry{}
+	emptypairingQueryCache := map[string][]epochstoragetypes.StakeEntry{}
+
 	keeper := &Keeper{
 		cdc:                cdc,
 		storeKey:           storeKey,
@@ -86,6 +93,8 @@ func NewKeeper(
 		downtimeKeeper:     downtimeKeeper,
 		dualstakingKeeper:  dualstakingKeeper,
 		stakingKeeper:      stakingKeeper,
+		pairingQueryCache:  &emptypairingQueryCache,
+		pairingRelayCache:  &emptypairingRelayCache,
 	}
 
 	// note that the timer and badgeUsedCu keys are the same (so we can use only the second arg)
@@ -106,7 +115,12 @@ func (k Keeper) Logger(ctx sdk.Context) log.Logger {
 }
 
 func (k Keeper) BeginBlock(ctx sdk.Context) {
+
+	// reset pairing relay cache every block
+	*k.pairingRelayCache = map[string][]epochstoragetypes.StakeEntry{}
 	if k.epochStorageKeeper.IsEpochStart(ctx) {
+		// reset pairing query cache every epoch
+		*k.pairingQueryCache = map[string][]epochstoragetypes.StakeEntry{}
 		// remove old session payments
 		k.RemoveOldEpochPayments(ctx)
 		// unstake/jail unresponsive providers
